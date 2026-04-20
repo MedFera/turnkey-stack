@@ -229,10 +229,15 @@ chmod 600 "${ENV_FILE}"
 ok ".env filled and locked to 600"
 
 
-# ── 4. Pull images ───────────────────────────────────────────────────────────
+# ── 4. Build local images + pull registry images ─────────────────────────────
+step "Building local images (stack-restic)"
+(cd "${STACK_ROOT}" && docker compose build)
+
 if (( SKIP_PULL == 0 )); then
-  step "Pulling images"
-  (cd "${STACK_ROOT}" && docker compose pull)
+  step "Pulling registry images"
+  # Compose pull will attempt the build-tagged image against the registry and
+  # warn (not fail) when it's not found — expected and harmless.
+  (cd "${STACK_ROOT}" && docker compose pull || true)
 else
   info "skipping image pull (--skip-pull)"
 fi

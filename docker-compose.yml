@@ -462,19 +462,17 @@ services:
   # ════════════════════════════════════════════════════════════════════════
   # RESTIC — backup engine (triggered by Ofelia on BACKUP_SCHEDULE)
   # Long-running container with restic + pg_dump + mariadb-dump pre-installed.
-  # The actual backup logic lives in restic/scripts/backup.sh (deliverable 5).
+  # The actual backup logic lives in restic/scripts/backup.sh.
+  # Image is built locally from ./restic/Dockerfile — no apk at runtime.
   # ════════════════════════════════════════════════════════════════════════
 
   restic:
-    image: alpine:3.19
+    build:
+      context: ./restic
+    image: stack-restic:local
     container_name: stack-restic
     restart: unless-stopped
-    entrypoint:
-      - /bin/sh
-      - -c
-      - |
-        apk add --no-cache bash restic postgresql15-client mariadb-client ca-certificates tzdata coreutils >/dev/null
-        exec tail -f /dev/null
+    command: ["tail", "-f", "/dev/null"]
     environment:
       <<: *common-env
       RESTIC_REPOSITORY: ${RESTIC_REPOSITORY}
