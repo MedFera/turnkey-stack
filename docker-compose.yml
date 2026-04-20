@@ -1,0 +1,518 @@
+# =============================================================================
+# Turnkey Self-Hosted Business Server v1 — docker-compose.yml
+# -----------------------------------------------------------------------------
+# Deploys: Caddy · Nextcloud + PostgreSQL + Redis · ONLYOFFICE · Dolibarr +
+#          MariaDB · wg-easy · Uptime Kuma · Stirling-PDF · DocuSeal ·
+#          Kimai + MariaDB · Paperless-ngx + PostgreSQL + Redis ·
+#          Vaultwarden · Restic · Ofelia (scheduler)
+#
+# Lives at:  /srv/stack/docker-compose.yml
+# Reads:     /srv/stack/.env         (chmod 600, owned by stackuser)
+# Bind-root: /srv/stack/<service>/*  (created by scripts/init-folders.sh)
+#
+# Networking:
+#   - edge      : Caddy only. Publishes 80/443 to host.
+#   - internal  : All apps + databases. Databases NEVER publish ports.
+#   - Caddy is attached to both so it can proxy into internal.
+#
+# Conventions:
+#   - Container names: stack-<service>
+#   - restart: unless-stopped everywhere
+#   - Health checks on every database; apps wait with service_healthy
+#   - Zero hardcoded secrets — every value comes from .env
+# =============================================================================
+
+name: turnkey-stack
+
+
+# ── Networks ─────────────────────────────────────────────────────────────────
+networks:
+  edge:
+    name: stack-edge
+  internal:
+    name: stack-internal
+
+
+# ── Reusable env fragments ───────────────────────────────────────────────────
+x-common-env: &common-env
+  TZ: ${TIMEZONE}
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+
+services:
+
+  # ════════════════════════════════════════════════════════════════════════
+  # REVERSE PROXY
+  # ════════════════════════════════════════════════════════════════════════
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: stack-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"              # HTTP/3
+    environment:
+      <<: *common-env
+      DOMAIN: ${DOMAIN}
+      SERVER_IP: ${SERVER_IP}
+      ADMIN_EMAIL: ${ADMIN_EMAIL}
+      TRUSTED_CIDRS: ${TRUSTED_CIDRS}
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy/data:/data
+      - ./caddy/config:/config
+    networks: [edge, internal]
+    logging: *default-logging
+
+
+  # ════════════════════════════════════════════════════════════════════════
+  # NEXTCLOUD — files, sync, collaboration
+  # ════════════════════════════════════════════════════════════════════════
+
+  nextcloud-db:
+    image: postgres:15-alpine
+    container_name: stack-nextcloud-db
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      POSTGRES_DB: nextcloud
+      POSTGRES_USER: nextcloud
+      POSTGRES_PASSWORD: ${NC_DB_PASS}
+    volumes:
+      - ./nextcloud/db:/var/lib/postgresql/data
+    networks: [internal]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nextcloud -d nextcloud"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    logging: *default-logging
+
+  nextcloud-redis:
+    image: redis:7-alpine
+    container_name: stack-nextcloud-redis
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]   # cache-only
+    environment:
+      <<: *common-env
+    networks: [internal]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    logging: *default-logging
+
+  nextcloud:
+    image: nextcloud:stable
+    container_name: stack-nextcloud
+    restart: unless-stopped
+    depends_on:
+      nextcloud-db: {condition: service_healthy}
+      nextcloud-redis: {condition: service_healthy}
+    environment:
+      <<: *common-env
+      POSTGRES_HOST: nextcloud-db
+      POSTGRES_DB: nextcloud
+      POSTGRES_USER: nextcloud
+      POSTGRES_PASSWORD: ${NC_DB_PASS}
+      REDIS_HOST: nextcloud-redis
+      NEXTCLOUD_ADMIN_USER: ${NC_ADMIN_USER}
+      NEXTCLOUD_ADMIN_PASSWORD: ${NC_ADMIN_PASS}
+      NEXTCLOUD_TRUSTED_DOMAINS: cloud.${DOMAIN}
+      TRUSTED_PROXIES: 172.16.0.0/12     # docker bridge range (Caddy sits here)
+      OVERWRITEPROTOCOL: https
+      OVERWRITEHOST: cloud.${DOMAIN}
+      OVERWRITECLIURL: https://cloud.${DOMAIN}
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_PORT: ${SMTP_PORT}
+      SMTP_NAME: ${SMTP_USER}
+      SMTP_PASSWORD: ${SMTP_PASS}
+      SMTP_SECURE: tls
+      MAIL_FROM_ADDRESS: ${SMTP_FROM}
+    volumes:
+      - ./nextcloud/config:/var/www/html/config
+      - ./nextcloud/data:/var/www/html/data
+    networks: [internal]
+    logging: *default-logging
+
+
+  # ════════════════════════════════════════════════════════════════════════
+  # ONLYOFFICE DOCUMENT SERVER — JWT-integrated with Nextcloud
+  # ════════════════════════════════════════════════════════════════════════
+
+  onlyoffice:
+    image: onlyoffice/documentserver:latest
+    container_name: stack-onlyoffice
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      JWT_ENABLED: "true"
+      JWT_SECRET: ${ONLYOFFICE_JWT}
+      JWT_HEADER: AuthorizationJwt
+      USE_UNAUTHORIZED_STORAGE: "false"
+    volumes:
+      - ./onlyoffice/data:/var/www/onlyoffice/Data
+      - ./onlyoffice/logs:/var/log/onlyoffice
+    networks: [internal]
+    logging: *default-logging
+
+
+  # ════════════════════════════════════════════════════════════════════════
+  # DOLIBARR — CRM / invoicing (VPN-only via Caddy matcher)
+  # ════════════════════════════════════════════════════════════════════════
+
+  dolibarr-db:
+    image: mariadb:10.11
+    container_name: stack-dolibarr-db
+    restart: unless-stopped
+    command:
+      - --transaction-isolation=READ-COMMITTED
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    environment:
+      <<: *common-env
+      MARIADB_ROOT_PASSWORD: ${DOLI_DB_PASS}
+      MARIADB_DATABASE: dolibarr
+      MARIADB_USER: dolibarr
+      MARIADB_PASSWORD: ${DOLI_DB_PASS}
+    volumes:
+      - ./dolibarr/db:/var/lib/mysql
+    networks: [internal]
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    logging: *default-logging
+
+  dolibarr:
+    image: dolibarr/dolibarr:latest
+    container_name: stack-dolibarr
+    restart: unless-stopped
+    depends_on:
+      dolibarr-db: {condition: service_healthy}
+    environment:
+      <<: *common-env
+      DOLI_DB_TYPE: mysqli
+      DOLI_DB_HOST: dolibarr-db
+      DOLI_DB_HOST_PORT: 3306
+      DOLI_DB_NAME: dolibarr
+      DOLI_DB_USER: dolibarr
+      DOLI_DB_PASSWORD: ${DOLI_DB_PASS}
+      DOLI_ADMIN_LOGIN: admin
+      DOLI_ADMIN_PASSWORD: ${DOLI_ADMIN_PASS}
+      DOLI_URL_ROOT: https://crm.${DOMAIN}
+      DOLI_HTTPS: 1
+      DOLI_PROD: 1
+      DOLI_COMPANY_NAME: ${CLIENT_NAME}
+    volumes:
+      - ./dolibarr/documents:/var/www/documents
+    networks: [internal]
+    logging: *default-logging
+
+
+  # ════════════════════════════════════════════════════════════════════════
+  # WG-EASY — WireGuard VPN (UI is VPN-only via Caddy matcher)
+  # ════════════════════════════════════════════════════════════════════════
+
+  wg-easy:
+    image: ghcr.io/wg-easy/wg-easy:latest
+    container_name: stack-wg-easy
+    restart: unless-stopped
+    ports:
+      - "${WG_PORT}:51820/udp"     # WireGuard tunnel (UDP, public)
+    environment:
+      <<: *common-env
+      WG_HOST: ${WG_HOST}
+      PASSWORD: ${WG_PASSWORD}
+      WG_PORT: ${WG_PORT}
+      WG_DEFAULT_ADDRESS: 10.8.0.x
+      WG_DEFAULT_DNS: 1.1.1.1
+      WG_ALLOWED_IPS: 10.8.0.0/24,192.168.0.0/16
+      LANG: en
+    volumes:
+      - ./wireguard/config:/etc/wireguard
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    sysctls:
+      net.ipv4.ip_forward: 1
+      net.ipv4.conf.all.src_valid_mark: 1
+    networks: [internal]
+    logging: *default-logging
+
+
+  # ════════════════════════════════════════════════════════════════════════
+  # UPTIME KUMA — monitoring (VPN-only via Caddy matcher)
+  # ════════════════════════════════════════════════════════════════════════
+
+  uptime-kuma:
+    image: louislam/uptime-kuma:1
+    container_name: stack-uptime-kuma
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+    volumes:
+      - ./uptime-kuma/data:/app/data
+    networks: [internal]
+    logging: *default-logging
+
+
+  # ════════════════════════════════════════════════════════════════════════
+  # STIRLING-PDF — browser PDF editor
+  # ════════════════════════════════════════════════════════════════════════
+
+  stirling-pdf:
+    image: frooodle/s-pdf:latest
+    container_name: stack-stirling-pdf
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      DOCKER_ENABLE_SECURITY: "false"
+      LANGS: en_GB
+      SYSTEM_DEFAULTLOCALE: en-US
+    volumes:
+      - ./stirling-pdf/training-data:/usr/share/tesseract-ocr/5/tessdata
+      - ./stirling-pdf/tessdata:/configs
+      - ./stirling-pdf/logs:/logs
+    networks: [internal]
+    logging: *default-logging
+
+
+  # ════════════════════════════════════════════════════════════════════════
+  # DOCUSEAL — document signing
+  # ════════════════════════════════════════════════════════════════════════
+
+  docuseal:
+    image: docuseal/docuseal:latest
+    container_name: stack-docuseal
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      SECRET_KEY_BASE: ${DOCUSEAL_SECRET}
+      HOST: sign.${DOMAIN}
+      FORCE_SSL: "true"
+      SMTP_ADDRESS: ${SMTP_HOST}
+      SMTP_PORT: ${SMTP_PORT}
+      SMTP_USERNAME: ${SMTP_USER}
+      SMTP_PASSWORD: ${SMTP_PASS}
+      SMTP_FROM: ${SMTP_FROM}
+    volumes:
+      - ./docuseal/data:/data
+    networks: [internal]
+    logging: *default-logging
+
+
+  # ════════════════════════════════════════════════════════════════════════
+  # KIMAI — time tracking
+  # ════════════════════════════════════════════════════════════════════════
+
+  kimai-db:
+    image: mariadb:10.11
+    container_name: stack-kimai-db
+    restart: unless-stopped
+    command:
+      - --default-storage-engine=innodb
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    environment:
+      <<: *common-env
+      MARIADB_ROOT_PASSWORD: ${KIMAI_DB_PASS}
+      MARIADB_DATABASE: kimai
+      MARIADB_USER: kimai
+      MARIADB_PASSWORD: ${KIMAI_DB_PASS}
+    volumes:
+      - ./kimai/db:/var/lib/mysql
+    networks: [internal]
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    logging: *default-logging
+
+  kimai:
+    image: kimai/kimai2:apache
+    container_name: stack-kimai
+    restart: unless-stopped
+    depends_on:
+      kimai-db: {condition: service_healthy}
+    environment:
+      <<: *common-env
+      APP_ENV: prod
+      TRUSTED_HOSTS: localhost,time.${DOMAIN}
+      TRUSTED_PROXIES: 172.16.0.0/12
+      DATABASE_URL: mysql://kimai:${KIMAI_DB_PASS}@kimai-db/kimai?charset=utf8mb4&serverVersion=10.11.0-MariaDB
+      ADMINMAIL: ${KIMAI_ADMIN_EMAIL}
+      ADMINPASS: ${KIMAI_ADMIN_PASS}
+      MAILER_URL: "smtp://${SMTP_USER}:${SMTP_PASS}@${SMTP_HOST}:${SMTP_PORT}"
+      MAILER_FROM: ${SMTP_FROM}
+    volumes:
+      - ./kimai/data:/opt/kimai/var/data
+    networks: [internal]
+    logging: *default-logging
+
+
+  # ════════════════════════════════════════════════════════════════════════
+  # PAPERLESS-NGX — document archive + OCR (own PostgreSQL + Redis)
+  # ════════════════════════════════════════════════════════════════════════
+
+  paperless-db:
+    image: postgres:15-alpine
+    container_name: stack-paperless-db
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      POSTGRES_DB: paperless
+      POSTGRES_USER: paperless
+      POSTGRES_PASSWORD: ${PAPERLESS_DB_PASS}
+    volumes:
+      - ./paperless/db:/var/lib/postgresql/data
+    networks: [internal]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U paperless -d paperless"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    logging: *default-logging
+
+  paperless-redis:
+    image: redis:7-alpine
+    container_name: stack-paperless-redis
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    networks: [internal]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    logging: *default-logging
+
+  paperless:
+    image: ghcr.io/paperless-ngx/paperless-ngx:latest
+    container_name: stack-paperless
+    restart: unless-stopped
+    depends_on:
+      paperless-db: {condition: service_healthy}
+      paperless-redis: {condition: service_healthy}
+    environment:
+      <<: *common-env
+      PAPERLESS_REDIS: redis://paperless-redis:6379
+      PAPERLESS_DBENGINE: postgresql
+      PAPERLESS_DBHOST: paperless-db
+      PAPERLESS_DBNAME: paperless
+      PAPERLESS_DBUSER: paperless
+      PAPERLESS_DBPASS: ${PAPERLESS_DB_PASS}
+      PAPERLESS_SECRET_KEY: ${PAPERLESS_SECRET}
+      PAPERLESS_ADMIN_USER: ${PAPERLESS_ADMIN_USER}
+      PAPERLESS_ADMIN_PASSWORD: ${PAPERLESS_ADMIN_PASS}
+      PAPERLESS_URL: https://archive.${DOMAIN}
+      PAPERLESS_TRUSTED_PROXIES: 172.16.0.0/12
+      PAPERLESS_TIME_ZONE: ${TIMEZONE}
+      PAPERLESS_OCR_LANGUAGE: eng
+    volumes:
+      - ./paperless/data:/usr/src/paperless/data
+      - ./paperless/media:/usr/src/paperless/media
+      - ./paperless/export:/usr/src/paperless/export
+      - ./paperless/consume:/usr/src/paperless/consume
+    networks: [internal]
+    logging: *default-logging
+
+
+  # ════════════════════════════════════════════════════════════════════════
+  # VAULTWARDEN — password manager
+  # ════════════════════════════════════════════════════════════════════════
+
+  vaultwarden:
+    image: vaultwarden/server:latest
+    container_name: stack-vaultwarden
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      DOMAIN: https://vault.${DOMAIN}
+      ADMIN_TOKEN: ${VAULTWARDEN_ADMIN}
+      SIGNUPS_ALLOWED: "false"
+      INVITATIONS_ALLOWED: "true"
+      WEBSOCKET_ENABLED: "true"
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_PORT: ${SMTP_PORT}
+      SMTP_USERNAME: ${SMTP_USER}
+      SMTP_PASSWORD: ${SMTP_PASS}
+      SMTP_FROM: ${SMTP_FROM}
+      SMTP_SECURITY: starttls
+    volumes:
+      - ./vaultwarden/data:/data
+    networks: [internal]
+    logging: *default-logging
+
+
+  # ════════════════════════════════════════════════════════════════════════
+  # RESTIC — backup engine (triggered by Ofelia on BACKUP_SCHEDULE)
+  # Long-running container with restic + pg_dump + mariadb-dump pre-installed.
+  # The actual backup logic lives in restic/scripts/backup.sh (deliverable 5).
+  # ════════════════════════════════════════════════════════════════════════
+
+  restic:
+    image: alpine:3.19
+    container_name: stack-restic
+    restart: unless-stopped
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        apk add --no-cache bash restic postgresql15-client mariadb-client ca-certificates tzdata coreutils >/dev/null
+        exec tail -f /dev/null
+    environment:
+      <<: *common-env
+      RESTIC_REPOSITORY: ${RESTIC_REPOSITORY}
+      RESTIC_PASSWORD: ${RESTIC_PASSWORD}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      NC_DB_PASS: ${NC_DB_PASS}
+      DOLI_DB_PASS: ${DOLI_DB_PASS}
+      KIMAI_DB_PASS: ${KIMAI_DB_PASS}
+      PAPERLESS_DB_PASS: ${PAPERLESS_DB_PASS}
+    volumes:
+      - ./:/srv/stack:ro                            # all app data (read-only)
+      - ./restic/scripts:/scripts:ro                # backup.sh lives here
+      - ./restic/logs:/var/log/restic               # timestamped log output
+      - /srv/backups:/srv/backups                   # used when RESTIC_REPOSITORY=/srv/backups
+    networks: [internal]
+    labels:
+      # Ofelia picks up these labels and schedules backup.sh via docker exec.
+      ofelia.enabled: "true"
+      ofelia.job-exec.backup.schedule: ${BACKUP_SCHEDULE}
+      ofelia.job-exec.backup.command: "/scripts/backup.sh"
+    logging: *default-logging
+
+
+  # ════════════════════════════════════════════════════════════════════════
+  # OFELIA — cron-style scheduler (watches Docker labels)
+  # ════════════════════════════════════════════════════════════════════════
+
+  ofelia:
+    image: mcuadros/ofelia:latest
+    container_name: stack-ofelia
+    restart: unless-stopped
+    command: daemon --docker
+    depends_on:
+      - restic
+    environment:
+      <<: *common-env
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [internal]
+    logging: *default-logging
