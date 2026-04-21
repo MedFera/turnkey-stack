@@ -16,9 +16,10 @@
 #   sudo ./scripts/test-deploy.sh --teardown      # docker compose down -v
 #
 # Safety:
-#   Refuses to run if DOMAIN in .env does NOT end in `.localhost` unless the
-#   `--force` flag is passed. This prevents accidentally running destructive
-#   backup/restore round-trips against a production deploy.
+#   Refuses to run unless DOMAIN in .env looks like a lab domain (ends in
+#   .localhost, .test, .internal, .lab, .home.arpa, or .intranet). The
+#   `--force` flag bypasses this check. This prevents accidentally running
+#   destructive backup/restore round-trips against a production deploy.
 #
 # Exit:   0 = all tests passed   1 = one or more failed   2 = refused to run
 # =============================================================================
@@ -78,8 +79,13 @@ set -a; source "${ENV_FILE}"; set +a
 : "${DOMAIN:?DOMAIN missing from .env}"
 : "${RESTIC_PASSWORD:?RESTIC_PASSWORD missing from .env}"
 
-if [[ "${DOMAIN}" != *.localhost && "${FORCE}" -ne 1 ]]; then
-  printf '%sDOMAIN=%s does not end in .localhost.%s\n' "${C_R}" "${DOMAIN}" "${C_N}"
+is_lab_domain=0
+case "${DOMAIN}" in
+  *.localhost|*.test|*.internal|*.lab|*.home.arpa|*.intranet) is_lab_domain=1 ;;
+esac
+if (( is_lab_domain == 0 )) && (( FORCE == 0 )); then
+  printf '%sDOMAIN=%s is not a recognized lab TLD.%s\n' "${C_R}" "${DOMAIN}" "${C_N}" >&2
+  printf 'Lab TLDs: .localhost .test .internal .lab .home.arpa .intranet\n' >&2
   printf 'Pass --force to run destructive tests against a non-lab deploy.\n' >&2
   exit 2
 fi
@@ -98,9 +104,11 @@ if (( TEARDOWN )); then
 fi
 
 
-# ── /etc/hosts for .localhost subdomains (lab-only) ──────────────────────────
+# ── /etc/hosts for lab-TLD subdomains ────────────────────────────────────────
+# Lab TLDs (.test, .localhost, .internal, etc.) never resolve via public DNS,
+# so we need /etc/hosts entries on the VM to smoke-test from a browser there.
 SUBS=(cloud docs crm sign pdf time archive vault vpn status)
-if [[ "${DOMAIN}" == *.localhost ]]; then
+if (( is_lab_domain )); then
   phase "/etc/hosts entries for ${DOMAIN}"
   MISSING=()
   for s in "${SUBS[@]}"; do

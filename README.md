@@ -71,8 +71,13 @@ Infrastructure layers:
 **Inside the Ubuntu VM**
 
 - Ubuntu Server 24.04 LTS, fully updated
-- `docker.io`, `docker-compose-v2`, `openssl`, `git`
+- `docker.io`, `docker-compose-v2`, `docker-buildx-plugin` (compose v2 needs buildx)
+- `rsync`, `openssl`, `git`, `awk`, `sed`, `grep` (GNU coreutils usually present)
 - Root / sudo access
+
+`deploy.sh` validates every one of these at preflight and fails with an
+actionable message (including the `apt-get install` command) if any are
+missing. No silent failures later in the pipeline.
 
 **Network**
 
@@ -82,14 +87,27 @@ Infrastructure layers:
 
 ---
 
-## Quick start — lab deployment (`.localhost`)
+## Quick start — lab deployment
 
 Use this to test the stack on a throwaway VM before deploying to a client.
+
+**Pick the right TLD for your lab:**
+
+| Scenario | Domain to use | Why |
+|---|---|---|
+| Everything from the VM itself (`curl localhost`) | `company.localhost` + `--ip 127.0.0.1` | `.localhost` is RFC 6761 loopback-only |
+| Other LAN machines need to reach the stack | `company.test` + `--ip 192.168.1.10` | `.test` is RFC 2606 reserved — fine for LAN, won't leak to the internet |
+| Matches your existing internal naming | `company.internal` / `.lab` | Same as `.test` — all lab TLDs are unresolvable in public DNS |
+
+**Do not** pair `.localhost` with a LAN IP. Other machines on the LAN will
+try to resolve `*.company.localhost` to their own loopback and fail silently.
+`deploy.sh` rejects this pairing unless you pass `--force`.
 
 ```bash
 # 1. Install prerequisites on the Ubuntu VM
 sudo apt update
-sudo apt install -y docker.io docker-compose-v2 openssl git
+sudo apt install -y docker.io docker-compose-v2 docker-buildx-plugin \
+                    rsync openssl git
 
 # 2. Clone / copy the repo
 git clone <your-repo> turnkey-stack
@@ -97,18 +115,24 @@ cd turnkey-stack
 
 # 3. Deploy against a lab domain (Caddy auto-issues internal certs)
 sudo ./scripts/deploy.sh \
-  --domain company.localhost \
+  --domain company.test \
   --ip 192.168.1.10
 
-# 4. Run the acceptance test
+# 4. On each client machine that should reach the stack, add to /etc/hosts
+#    (or the Windows equivalent):
+#       192.168.1.10  cloud.company.test
+#       192.168.1.10  docs.company.test
+#       ...etc for all 10 subdomains.
+#    Or run the acceptance test on the VM itself:
 sudo ./scripts/test-deploy.sh --fix-hosts
 ```
 
-The `--fix-hosts` flag adds `127.0.0.1 <sub>.company.localhost` entries to
-`/etc/hosts` so the VM can resolve the subdomains. Browsers will flag the
-internal certs as untrusted — accept the warning for lab use, or import
-Caddy's root from `/srv/stack/caddy/data/caddy/pki/authorities/local/root.crt`
-into the OS trust store.
+The `--fix-hosts` flag adds `127.0.0.1 <sub>.company.<tld>` entries to the
+VM's `/etc/hosts` so the smoke test can run without a separate resolver.
+Browsers will flag the internal certs as untrusted — accept the warning for
+lab use, or import Caddy's root from
+`/srv/stack/caddy/data/caddy/pki/authorities/local/root.crt` into the OS
+trust store.
 
 ---
 
@@ -173,19 +197,57 @@ See [`.env.template`](.env.template) for every variable with inline comments.
 
 ## First-run manual tasks
 
-Some integrations can't be fully automated in v1 and need a one-time setup
-pass after `deploy.sh` completes.
+`deploy.sh` brings the stack UP. **`configure-apps.sh` wires it together** —
+run it once, immediately after deploy. Everything below that the script can
+automate, it does; the rest are browser-only and documented as manual steps.
 
-### 1. Wire ONLYOFFICE to Nextcloud
+### 0. Run the app-wiring script (do this first)
 
-1. Visit `https://cloud.DOMAIN` and log in as the admin user from `.env`
-   (`NC_ADMIN_USER` / `NC_ADMIN_PASS`).
-2. Apps → search "ONLYOFFICE" → install.
-3. Settings → ONLYOFFICE:
-   - Document Editing Service address: `https://docs.DOMAIN/`
-   - Secret key (leave ONLYOFFICE Server address blank): paste the value of
-     `ONLYOFFICE_JWT` from `.env`.
-4. Save. Open a `.docx` from Files to confirm the editor loads.
+```bash
+sudo /srv/stack/scripts/configure-apps.sh
+```
+
+What it does:
+
+- Waits for Nextcloud's first-run install to finish (`occ status` polling).
+- Installs + enables the ONLYOFFICE connector, sets the document server URL,
+  JWT secret, and JWT header — no more clicking around in Nextcloud's app
+  store.
+- Configures Nextcloud SMTP from the `SMTP_*` values in `.env` (skipped if
+  `SMTP_HOST` is blank).
+- Applies Nextcloud polish: trusted domains, overwrite URLs, default phone
+  region (best-effort from `TIMEZONE`), cron mode, preview providers,
+  missing DB indices.
+- Seeds Paperless starter tags: **Invoice**, **Receipt**, **Contract**,
+  **Tax** (POST to the internal REST API; skipped if they already exist).
+- Prints the short checklist of browser-only steps that follow below.
+
+Useful flags:
+
+| Flag | Purpose |
+| --- | --- |
+| `--dry-run` | Print every `occ` / `curl` command without executing |
+| `--print-only` | Just print the browser-step checklist and exit |
+| `--skip-smtp` | Skip the SMTP section even if `SMTP_HOST` is set |
+| `--skip-onlyoffice` | Skip just the ONLYOFFICE wiring |
+| `--skip-paperless` | Skip tag seeding |
+| `--skip-nextcloud` | Skip every Nextcloud stage |
+| `--nc-wait-seconds <n>` | Override the Nextcloud install-wait timeout (default 300) |
+
+It is **idempotent** — re-running is safe. It checks app install state
+before installing, and fetches existing Paperless tags before POSTing new
+ones.
+
+### 1. Verify ONLYOFFICE in Nextcloud
+
+After `configure-apps.sh` runs, visit `https://cloud.DOMAIN` as admin →
+**Settings → Administration → ONLYOFFICE**. The server-reachability check
+should be green. Open a `.docx` from Files to confirm the editor loads.
+
+If the check fails, the most common cause is that Nextcloud cannot reach
+`https://docs.DOMAIN/` — confirm DNS, TLS, and that `ONLYOFFICE_JWT` is
+identical in both the Nextcloud app settings and the ONLYOFFICE container's
+env (it is, if `configure-apps.sh` set it and the stack's `.env` was correct).
 
 ### 2. Create your first WireGuard peer
 
@@ -210,20 +272,31 @@ pass after `deploy.sh` completes.
 3. Add HTTP(s) monitors for each public subdomain. A seed script is on the
    v1.0 roadmap — for now, add them by hand.
 
-### 5. Configure Nextcloud email + cron (recommended)
+### 5. Create DocuSeal owner account
 
-```bash
-cd /srv/stack
-sudo docker compose exec -u www-data nextcloud php occ \
-  config:system:set mail_smtphost --value="${SMTP_HOST}"
-# …and the rest of the SMTP / cron settings.
-```
-
-A post-deploy `occ` wrapper script is on the v1.0 roadmap.
+1. Visit `https://sign.DOMAIN`. First visit creates the owner account.
+2. Set company name + logo. If SMTP is configured, send a test envelope to
+   yourself to confirm delivery.
 
 ---
 
 ## Day-2 operations
+
+### Re-run the app-wiring script
+
+```bash
+# Idempotent — re-running reconciles config to what .env says:
+sudo /srv/stack/scripts/configure-apps.sh
+
+# Just reprint the browser-only checklist (no mutations):
+sudo /srv/stack/scripts/configure-apps.sh --print-only
+
+# Preview what it would do after an .env change:
+sudo /srv/stack/scripts/configure-apps.sh --dry-run
+```
+
+Useful after rotating `ONLYOFFICE_JWT`, changing SMTP, or adding Paperless
+tags to the starter set.
 
 ### Health check
 
@@ -240,8 +313,9 @@ from cron, or from an external monitor.
 sudo /srv/stack/scripts/test-deploy.sh
 ```
 
-Full backup + restore round-trip. **Refuses to run on non-`.localhost`
-domains** unless `--force` is passed.
+Full backup + restore round-trip. **Refuses to run on non-lab domains**
+(anything outside `.localhost`, `.test`, `.internal`, `.lab`, `.home.arpa`,
+`.intranet`) unless `--force` is passed.
 
 ### Viewing logs
 
@@ -372,6 +446,7 @@ Intentionally excluded — do **not** add these without a scope discussion:
 | Path | Purpose |
 |---|---|
 | [`scripts/deploy.sh`](scripts/deploy.sh) | One-shot deployment driver |
+| [`scripts/configure-apps.sh`](scripts/configure-apps.sh) | Post-deploy app wiring (ONLYOFFICE↔Nextcloud JWT, SMTP, Paperless tags) |
 | [`scripts/init-folders.sh`](scripts/init-folders.sh) | Provisions `/srv/stack/` + `stackuser` |
 | [`scripts/health-check.sh`](scripts/health-check.sh) | Container/HTTP/backup probe |
 | [`scripts/test-deploy.sh`](scripts/test-deploy.sh) | Lab acceptance test (safety-gated) |
@@ -385,7 +460,6 @@ Intentionally excluded — do **not** add these without a scope discussion:
 
 ## Roadmap — v1.0 pending items
 
-- Post-deploy `occ` hook for Nextcloud (ONLYOFFICE install, SMTP, cron, previews)
 - Weekly deep backup check (`restic check --read-data`)
 - Uptime Kuma seed script (pre-populate monitors via API)
 - Operational runbooks: `CLIENT_ONBOARDING.md`, `RESTORE.md`, `ROTATE_SECRETS.md`
