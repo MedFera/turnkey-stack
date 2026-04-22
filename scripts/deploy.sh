@@ -215,6 +215,20 @@ preflight_checks() {
   require_cmd rsync   "install with: apt-get install -y rsync"
   require_cmd docker  "install with: apt-get install -y docker.io"
 
+  # argon2 is used to hash the Vaultwarden admin token (required in VW >= 1.28).
+  # It is not mandatory — deploy.sh falls back gracefully — but install it now
+  # to avoid a second pass.
+  if ! command -v argon2 >/dev/null 2>&1; then
+    warn "argon2 not found — attempting auto-install (needed for Vaultwarden)"
+    if apt-get install -y -qq argon2 >/dev/null 2>&1; then
+      ok "argon2 installed"
+    else
+      warn "Could not install argon2 — Vaultwarden admin token will use fallback method"
+    fi
+  else
+    ok "argon2"
+  fi
+
   # Docker installed AND daemon reachable. These are separate failures.
   if ! docker info >/dev/null 2>&1; then
     die "Docker is installed but not usable.
@@ -488,21 +502,50 @@ render_env() {
   set_if_empty PAPERLESS_ADMIN_PASS "$(rand_b64 32)"
   set_if_empty DOCUSEAL_SECRET      "$(rand_hex 64)"
   # Vaultwarden >= 1.28 requires ADMIN_TOKEN to be an argon2 hash.
-  # We generate a random plaintext token, then hash it with Docker's
-  # vaultwarden image itself so no extra tools are needed on the host.
-  if [[ -z "$(awk -F= -v v="VAULTWARDEN_ADMIN" '$1==v{sub(/^[^=]*=/,"");print;exit}' "${env_file}")" ]]; then
+  # Strategy:
+  #   1. Try `argon2` CLI (apt: argon2) — fastest, no Docker pull needed.
+  #   2. Try hashing via the vaultwarden container itself.
+  #   3. Fall back to plaintext with a clear warning (works on VW <= 1.27).
+  #
+  # We also always re-hash if the current value looks like a plaintext token
+  # (i.e. does NOT start with $argon2) — handles re-runs after a failed deploy.
+  _vw_needs_hash() {
+    local cur
+    cur=$(awk -F= -v v="VAULTWARDEN_ADMIN" '$1==v{sub(/^[^=]*=/,"");print;exit}' "${env_file}")
+    [[ -z "${cur}" || "${cur}" != '$argon2'* ]]
+  }
+  if _vw_needs_hash; then
     local vw_plain vw_hash
     vw_plain="$(rand_b64 32)"
-    vw_hash=$(docker run --rm vaultwarden/server:latest \
-      /vaultwarden hash --preset owasp 2>/dev/null <<< "${vw_plain}" | tail -n1 || true)
+    vw_hash=""
+
+    # Method 1: argon2 CLI
+    if command -v argon2 &>/dev/null; then
+      local vw_salt
+      vw_salt="$(openssl rand -base64 16 | tr -d '\n')"
+      vw_hash=$(printf '%s' "${vw_plain}"         | argon2 "${vw_salt}" -id -t 3 -m 16 -p 4 -l 32 -e 2>/dev/null || true)
+    fi
+
+    # Method 2: vaultwarden binary inside running container
+    if [[ -z "${vw_hash}" ]]; then
+      vw_hash=$(docker exec stack-vaultwarden         /vaultwarden hash --preset owasp 2>/dev/null <<< "${vw_plain}"         | grep -E '^\$argon2' | tail -n1 || true)
+    fi
+
+    # Method 3: vaultwarden binary via temporary container
+    if [[ -z "${vw_hash}" ]]; then
+      vw_hash=$(docker run --rm vaultwarden/server:latest         /vaultwarden hash --preset owasp 2>/dev/null <<< "${vw_plain}"         | grep -E '^\$argon2' | tail -n1 || true)
+    fi
+
     if [[ -n "${vw_hash}" ]]; then
-      set_if_empty VAULTWARDEN_ADMIN "${vw_hash}"
-      # Store the plaintext under a separate key so the operator can retrieve it
-      set_if_empty VAULTWARDEN_ADMIN_PLAINTEXT "${vw_plain}"
+      # Write hash — sed replace even if key already exists (handles re-runs)
+      sed -i "s|^VAULTWARDEN_ADMIN=.*|VAULTWARDEN_ADMIN=${vw_hash}|" "${env_file}"
+      sed -i "s|^VAULTWARDEN_ADMIN_PLAINTEXT=.*|VAULTWARDEN_ADMIN_PLAINTEXT=${vw_plain}|" "${env_file}"
+      grep -q "^VAULTWARDEN_ADMIN_PLAINTEXT=" "${env_file}"         || printf 'VAULTWARDEN_ADMIN_PLAINTEXT=%s\n' "${vw_plain}" >> "${env_file}"
+      ok "VAULTWARDEN_ADMIN set (argon2 hash)"
     else
-      # Fallback: use plaintext (Vaultwarden 1.27 and earlier accept it)
-      warn "Could not hash Vaultwarden token — storing plaintext (may fail on VW >= 1.28)"
-      set_if_empty VAULTWARDEN_ADMIN "${vw_plain}"
+      warn "argon2 unavailable — storing plaintext VAULTWARDEN_ADMIN (VW >= 1.28 may reject this)"
+      warn "Fix: sudo apt-get install -y argon2 && re-run deploy.sh"
+      sed -i "s|^VAULTWARDEN_ADMIN=.*|VAULTWARDEN_ADMIN=${vw_plain}|" "${env_file}"
     fi
   fi
   set_if_empty WG_PASSWORD          "$(rand_b64 24)"
@@ -690,7 +733,17 @@ main() {
   start_stack
   wait_for_containers
   run_health_check
+
+  # print_summary may return 2 (degraded) — disable the ERR trap for this
+  # call so a degraded health result warns but does not abort the deploy.
+  # All containers are already running at this point; the summary is purely
+  # informational.
+  trap - ERR
   print_summary
+  local summary_rc=$?
+  trap 'on_err "${LINENO}" "${BASH_COMMAND}"' ERR
+
+  exit "${summary_rc}"
 }
 
 main "$@"
