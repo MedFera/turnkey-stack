@@ -512,7 +512,15 @@ render_env() {
   _vw_needs_hash() {
     local cur
     cur=$(awk -F= -v v="VAULTWARDEN_ADMIN" '$1==v{sub(/^[^=]*=/,"");print;exit}' "${env_file}")
-    [[ -z "${cur}" || "${cur}" != '$argon2'* ]]
+    # Needs (re-)hash if:
+    #   - empty, OR
+    #   - does not start with $argon2 (plain token), OR
+    #   - starts with $argon2 but NOT $$argon2 (written without $$ escaping
+    #     by a previous deploy run — Compose would treat it as interpolation)
+    if [[ -z "${cur}" ]]; then return 0; fi
+    if [[ "${cur}" == '$$argon2'* ]]; then return 1; fi  # already escaped
+    if [[ "${cur}" == '$argon2'* ]]; then return 0; fi   # unescaped — rewrite
+    return 0  # plaintext — hash it
   }
   if _vw_needs_hash; then
     local vw_plain vw_hash
@@ -537,8 +545,13 @@ render_env() {
     fi
 
     if [[ -n "${vw_hash}" ]]; then
+      # Docker Compose interpolates $ in .env values as variable references.
+      # Escape every $ in the argon2 hash by doubling it ($$ → literal $).
+      # Vaultwarden receives the unescaped value at runtime — Compose un-doubles.
+      local vw_hash_escaped
+      vw_hash_escaped="${vw_hash//'$'/'$$'}"
       # Write hash — sed replace even if key already exists (handles re-runs)
-      sed -i "s|^VAULTWARDEN_ADMIN=.*|VAULTWARDEN_ADMIN=${vw_hash}|" "${env_file}"
+      sed -i "s|^VAULTWARDEN_ADMIN=.*|VAULTWARDEN_ADMIN=${vw_hash_escaped}|" "${env_file}"
       sed -i "s|^VAULTWARDEN_ADMIN_PLAINTEXT=.*|VAULTWARDEN_ADMIN_PLAINTEXT=${vw_plain}|" "${env_file}"
       grep -q "^VAULTWARDEN_ADMIN_PLAINTEXT=" "${env_file}"         || printf 'VAULTWARDEN_ADMIN_PLAINTEXT=%s\n' "${vw_plain}" >> "${env_file}"
       ok "VAULTWARDEN_ADMIN set (argon2 hash)"
@@ -597,7 +610,34 @@ pull_images() {
 }
 
 
-# ── Stage 12: start_stack ────────────────────────────────────────────────────
+# ── Stage 12: ensure_wireguard ───────────────────────────────────────────────
+# wg-easy needs the wireguard kernel module loaded on the host.
+# On Ubuntu 20.04+ it ships with the kernel but may not be auto-loaded.
+# On VirtualBox VMs this is the most common reason wg-easy crash-loops.
+ensure_wireguard() {
+  log "Ensuring WireGuard kernel module"
+  if lsmod 2>/dev/null | grep -q '^wireguard'; then
+    ok "wireguard module already loaded"
+    return 0
+  fi
+  # Try to load it
+  if modprobe wireguard 2>/dev/null; then
+    ok "wireguard module loaded"
+    return 0
+  fi
+  # Not available — try installing wireguard-tools which pulls the kmod
+  warn "wireguard module not found — attempting install of wireguard-tools"
+  if apt-get install -y -qq wireguard-tools >/dev/null 2>&1 && modprobe wireguard 2>/dev/null; then
+    ok "wireguard module installed and loaded"
+    return 0
+  fi
+  warn "Could not load wireguard kernel module — stack-wg-easy may crash-loop"
+  warn "Fix on Ubuntu: sudo apt-get install -y wireguard-tools linux-modules-extra-\$(uname -r)"
+  warn "Fix on VirtualBox: ensure the VM kernel matches the host or install the HWE kernel"
+}
+
+
+# ── Stage 13: start_stack ────────────────────────────────────────────────────
 start_stack() {
   log "Starting stack"
   run bash -c "cd '${STACK_ROOT}' && docker compose up -d --remove-orphans"
@@ -664,10 +704,15 @@ run_health_check() {
   fi
   info "allowing 30s for first-run DB migrations..."
   sleep 30
-  set +e
-  "${STACK_ROOT}/scripts/health-check.sh"
+  # Run health-check in a subshell. We always want to continue to
+  # print_summary regardless of the result — a degraded check is a
+  # warning, not a deploy failure (all containers are already running).
+  # The ERR trap is temporarily disabled so the non-zero exit from a
+  # degraded health-check.sh does not abort deploy.sh.
+  trap - ERR
+  "${STACK_ROOT}/scripts/health-check.sh" || true
   HEALTH_RC=$?
-  set -e
+  trap 'on_err "${LINENO}" "${BASH_COMMAND}"' ERR
 }
 
 
@@ -730,6 +775,7 @@ main() {
   validate_compose
   build_images
   pull_images
+  ensure_wireguard
   start_stack
   wait_for_containers
   run_health_check

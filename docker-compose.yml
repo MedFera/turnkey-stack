@@ -248,10 +248,13 @@ services:
     sysctls:
       net.ipv4.ip_forward: 1
       net.ipv4.conf.all.src_valid_mark: 1
-    # privileged mode required when the host kernel wireguard module is not
-    # loaded (common in VirtualBox VMs). On bare-metal Proxmox this can be
-    # removed — the wireguard kmod is loaded by the host automatically.
+    # privileged gives the container access to the host wireguard kernel module.
+    # Required on VirtualBox VMs and some VPS providers. Safe on Proxmox VMs.
     privileged: true
+    # wg-easy crashes if the wireguard kernel module is absent even with
+    # privileged mode. On VirtualBox/Ubuntu the module ships with the kernel
+    # but may not be loaded. deploy.sh runs `modprobe wireguard` before
+    # starting the stack to ensure it is available.
     networks: [internal]
     logging: *default-logging
 
