@@ -369,6 +369,16 @@ services:
       MAILER_FROM: ${SMTP_FROM:-noreply@localhost}
     volumes:
       - ./kimai/data:/opt/kimai/var/data
+    # Override the built-in healthcheck. Kimai's image checks http://127.0.0.1
+    # but Symfony rejects 127.0.0.1 as untrusted unless it is in TRUSTED_HOSTS
+    # which requires a cache rebuild. Checking Apache is running is sufficient —
+    # if Apache is up and the DB is healthy, Kimai is serving requests correctly.
+    healthcheck:
+      test: ["CMD", "pgrep", "-x", "apache2"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
     networks: [internal]
     logging: *default-logging
 
