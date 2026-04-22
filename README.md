@@ -87,6 +87,28 @@ missing. No silent failures later in the pipeline.
 
 ---
 
+## Make scripts executable
+
+After cloning the repo, mark every script executable before running anything.
+Only needs to be done once per clone.
+
+```bash
+chmod +x scripts/deploy.sh
+chmod +x scripts/configure-apps.sh
+chmod +x scripts/init-folders.sh
+chmod +x scripts/health-check.sh
+chmod +x scripts/test-deploy.sh
+chmod +x restic/scripts/backup.sh
+```
+
+Or in one line:
+
+```bash
+chmod +x scripts/*.sh restic/scripts/*.sh
+```
+
+---
+
 ## Quick start — lab deployment
 
 Use this to test the stack on a throwaway VM before deploying to a client.
@@ -106,8 +128,7 @@ try to resolve `*.company.localhost` to their own loopback and fail silently.
 ```bash
 # 1. Install prerequisites on the Ubuntu VM
 sudo apt update
-sudo apt install -y docker.io docker-compose-v2 docker-buildx-plugin \
-                    rsync openssl git
+sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin openssl git
 
 # 2. Clone / copy the repo
 git clone <your-repo> turnkey-stack

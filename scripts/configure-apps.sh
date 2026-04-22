@@ -167,8 +167,8 @@ preflight_checks() {
     fi
   fi
 
-  (( DRY_RUN ))    && warn "DRY-RUN mode: no changes will be made"
-  (( PRINT_ONLY )) && warn "PRINT-ONLY mode: will only print manual steps and exit"
+  if (( DRY_RUN ));    then warn "DRY-RUN mode: no changes will be made"; fi
+  if (( PRINT_ONLY )); then warn "PRINT-ONLY mode: will only print manual steps and exit"; fi
 }
 
 container_running() {
@@ -226,8 +226,8 @@ occ_capture() {
 # The image completes its initial `occ maintenance:install` inside entrypoint
 # the first time it boots. Hitting `occ` before that returns an error. Poll.
 wait_for_nextcloud() {
-  (( SKIP_NEXTCLOUD )) && { skip "wait_for_nextcloud"; return 0; }
-  (( DRY_RUN ))       && { info "would wait up to ${NC_WAIT_SECONDS}s for Nextcloud install"; return 0; }
+  if (( SKIP_NEXTCLOUD )); then skip "wait_for_nextcloud"; return 0; fi
+  if (( DRY_RUN ));        then info "would wait up to ${NC_WAIT_SECONDS}s for Nextcloud install"; return 0; fi
 
   log "Waiting for Nextcloud install (timeout ${NC_WAIT_SECONDS}s)"
   local deadline=$(( $(date +%s) + NC_WAIT_SECONDS ))
@@ -337,7 +337,7 @@ configure_nextcloud_smtp() {
 # Items that don't belong to a specific app but make Nextcloud behave
 # correctly on first boot.
 configure_nextcloud_polish() {
-  (( SKIP_NEXTCLOUD )) && { skip "Nextcloud polish"; return 0; }
+  if (( SKIP_NEXTCLOUD )); then skip "Nextcloud polish"; return 0; fi
 
   log "Nextcloud polish"
 
@@ -402,7 +402,7 @@ configure_nextcloud_polish() {
 # internal docker network. We use an ephemeral curl container attached to
 # stack-internal and talking to `paperless:8000` by service name.
 seed_paperless_tags() {
-  (( SKIP_PAPERLESS )) && { skip "Paperless tags"; return 0; }
+  if (( SKIP_PAPERLESS )); then skip "Paperless tags"; return 0; fi
 
   log "Seeding Paperless starter tags"
 

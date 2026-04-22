@@ -247,7 +247,7 @@ or for Ubuntu 24.04:
   info "client:       ${CLIENT_NAME}"
   info "admin email:  ${ADMIN_EMAIL}"
   info "timezone:     ${TIMEZONE}"
-  (( DRY_RUN )) && warn "DRY-RUN mode: no files or containers will be touched"
+  if (( DRY_RUN )); then warn "DRY-RUN mode: no files or containers will be touched"; fi
 }
 
 
