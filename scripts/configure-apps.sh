@@ -210,15 +210,22 @@ load_env() {
 
 
 # ── occ helper ───────────────────────────────────────────────────────────────
-# All Nextcloud ops go through `occ`, which must run as the www-data user.
+# All Nextcloud ops go through `occ`. The user that owns config/config.php
+# varies by image version — www-data (33) in older images, a dynamic uid
+# in newer ones. We detect the owner at runtime so occ always runs as the
+# correct user regardless of which uid the image chose.
+_nc_occ_user() {
+  docker exec "${NC_CONTAINER}" stat -c '%u' /var/www/html/config/config.php 2>/dev/null     || echo "www-data"
+}
+
 occ() {
-  run docker exec -u www-data "${NC_CONTAINER}" php /var/www/html/occ "$@"
+  run docker exec -u "$(_nc_occ_user)" "${NC_CONTAINER}" php /var/www/html/occ "$@"
 }
 
 # occ with output capture (NOT run through run(), since dry-run has nothing
 # meaningful to capture — callers handle the dry-run case themselves).
 occ_capture() {
-  docker exec -u www-data "${NC_CONTAINER}" php /var/www/html/occ "$@"
+  docker exec -u "$(_nc_occ_user)" "${NC_CONTAINER}" php /var/www/html/occ "$@"
 }
 
 
