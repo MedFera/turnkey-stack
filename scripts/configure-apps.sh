@@ -508,7 +508,7 @@ ${C_B}═══ Manual steps that require a browser ═══${C_N}
      from .env — do not share).
 
   ${C_B}4. wg-easy${C_N}       →  https://vpn.${d}/   (VPN-only, bootstrap via LAN)
-     Log in with WG_PASSWORD from .env. Create a peer per user/device,
+     Log in with WG_PASSWORD_PLAIN from .env. Create a peer per user/device,
      download .conf or scan QR from the WireGuard mobile/desktop app.
 
   ${C_B}5. Dolibarr${C_N}      →  https://crm.${d}/   (VPN-only)
