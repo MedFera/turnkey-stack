@@ -215,9 +215,7 @@ preflight_checks() {
   require_cmd rsync   "install with: apt-get install -y rsync"
   require_cmd docker  "install with: apt-get install -y docker.io"
 
-  # argon2 is used to hash the Vaultwarden admin token (required in VW >= 1.28).
-  # It is not mandatory — deploy.sh falls back gracefully — but install it now
-  # to avoid a second pass.
+  # argon2 — hashes the Vaultwarden admin token (required in VW >= 1.28).
   if ! command -v argon2 >/dev/null 2>&1; then
     warn "argon2 not found — attempting auto-install (needed for Vaultwarden)"
     if apt-get install -y -qq argon2 >/dev/null 2>&1; then
@@ -227,6 +225,19 @@ preflight_checks() {
     fi
   else
     ok "argon2"
+  fi
+
+  # python3-bcrypt — hashes the wg-easy admin password (required in wg-easy v14+).
+  if ! python3 -c "import bcrypt" 2>/dev/null; then
+    warn "python3-bcrypt not found — attempting auto-install (needed for wg-easy)"
+    if apt-get install -y -qq python3-bcrypt >/dev/null 2>&1; then
+      ok "python3-bcrypt installed"
+    else
+      warn "Could not install python3-bcrypt — trying apache2-utils htpasswd as fallback"
+      apt-get install -y -qq apache2-utils >/dev/null 2>&1 || true
+    fi
+  else
+    ok "python3-bcrypt"
   fi
 
   # Docker installed AND daemon reachable. These are separate failures.
@@ -561,7 +572,44 @@ render_env() {
       sed -i "s|^VAULTWARDEN_ADMIN=.*|VAULTWARDEN_ADMIN=${vw_plain}|" "${env_file}"
     fi
   fi
-  set_if_empty WG_PASSWORD          "$(rand_b64 24)"
+  # wg-easy v14+ requires a bcrypt hash instead of a plaintext password.
+  # Generate a random plaintext, hash it with bcrypt, store both.
+  # The plaintext is stored as WG_PASSWORD_PLAIN so the operator can retrieve it.
+  _wg_needs_hash() {
+    local cur
+    cur=$(awk -F= -v v="WG_PASSWORD_HASH" '$1==v{sub(/^[^=]*=/,"");print;exit}' "${env_file}")
+    [[ -z "${cur}" ]]
+  }
+  if _wg_needs_hash; then
+    local wg_plain wg_hash
+    wg_plain="$(rand_b64 24)"
+    wg_hash=""
+    # Use Python to generate bcrypt hash — available on Ubuntu 24.04 via python3
+    if python3 -c "import bcrypt" 2>/dev/null; then
+      wg_hash=$(python3 -c         "import bcrypt,sys; pw=sys.argv[1].encode(); print(bcrypt.hashpw(pw,bcrypt.gensalt(rounds=12)).decode())"         "${wg_plain}" 2>/dev/null || true)
+    fi
+    # Fallback: use htpasswd from apache2-utils
+    if [[ -z "${wg_hash}" ]] && command -v htpasswd &>/dev/null; then
+      wg_hash=$(htpasswd -bnBC 12 "" "${wg_plain}" 2>/dev/null | tr -d ':
+' || true)
+    fi
+    if [[ -n "${wg_hash}" ]]; then
+      # Escape $ for Docker Compose variable interpolation
+      local wg_hash_escaped="${wg_hash//'$'/'$$'}"
+      sed -i "s|^WG_PASSWORD_HASH=.*|WG_PASSWORD_HASH=${wg_hash_escaped}|" "${env_file}"
+      grep -q "^WG_PASSWORD_HASH=" "${env_file}"         || printf 'WG_PASSWORD_HASH=%s
+' "${wg_hash_escaped}" >> "${env_file}"
+      sed -i "s|^WG_PASSWORD_PLAIN=.*|WG_PASSWORD_PLAIN=${wg_plain}|" "${env_file}"
+      grep -q "^WG_PASSWORD_PLAIN=" "${env_file}"         || printf 'WG_PASSWORD_PLAIN=%s
+' "${wg_plain}" >> "${env_file}"
+      ok "WG_PASSWORD_HASH set (bcrypt)"
+    else
+      warn "Could not generate bcrypt hash for wg-easy"
+      warn "Fix: sudo apt-get install -y python3-bcrypt && re-run deploy.sh"
+      grep -q "^WG_PASSWORD_HASH=" "${env_file}"         || printf 'WG_PASSWORD_HASH=
+' >> "${env_file}"
+    fi
+  fi
   set_if_empty RESTIC_PASSWORD      "$(rand_b64 48)"
 
   chown stackuser:stackuser "${env_file}"
