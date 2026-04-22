@@ -487,7 +487,24 @@ render_env() {
   set_if_empty PAPERLESS_SECRET     "$(rand_hex 32)"
   set_if_empty PAPERLESS_ADMIN_PASS "$(rand_b64 32)"
   set_if_empty DOCUSEAL_SECRET      "$(rand_hex 64)"
-  set_if_empty VAULTWARDEN_ADMIN    "$(rand_b64 48)"
+  # Vaultwarden >= 1.28 requires ADMIN_TOKEN to be an argon2 hash.
+  # We generate a random plaintext token, then hash it with Docker's
+  # vaultwarden image itself so no extra tools are needed on the host.
+  if [[ -z "$(awk -F= -v v="VAULTWARDEN_ADMIN" '$1==v{sub(/^[^=]*=/,"");print;exit}' "${env_file}")" ]]; then
+    local vw_plain vw_hash
+    vw_plain="$(rand_b64 32)"
+    vw_hash=$(docker run --rm vaultwarden/server:latest \
+      /vaultwarden hash --preset owasp 2>/dev/null <<< "${vw_plain}" | tail -n1 || true)
+    if [[ -n "${vw_hash}" ]]; then
+      set_if_empty VAULTWARDEN_ADMIN "${vw_hash}"
+      # Store the plaintext under a separate key so the operator can retrieve it
+      set_if_empty VAULTWARDEN_ADMIN_PLAINTEXT "${vw_plain}"
+    else
+      # Fallback: use plaintext (Vaultwarden 1.27 and earlier accept it)
+      warn "Could not hash Vaultwarden token — storing plaintext (may fail on VW >= 1.28)"
+      set_if_empty VAULTWARDEN_ADMIN "${vw_plain}"
+    fi
+  fi
   set_if_empty WG_PASSWORD          "$(rand_b64 24)"
   set_if_empty RESTIC_PASSWORD      "$(rand_b64 48)"
 
@@ -530,9 +547,10 @@ pull_images() {
     return 0
   fi
   log "Pulling registry images"
-  # compose pull attempts the locally-tagged build image against registry
-  # and warns when it's not found — expected and harmless, hence `|| true`.
-  run bash -c "cd '${STACK_ROOT}' && docker compose pull || true"
+  # `docker compose pull` tries to pull locally-built images (e.g. stack-restic)
+  # from a registry — they won't exist there, which prints a noisy error.
+  # Filter that specific message; suppress the exit code (harmless).
+  run bash -c "cd '${STACK_ROOT}' && docker compose pull 2>&1     | grep -v 'pull access denied\|repository does not exist\|may require.*docker login'     || true"
 }
 
 
@@ -551,20 +569,39 @@ wait_for_containers() {
     return 0
   fi
 
-  local deadline=$(( $(date +%s) + 300 ))
-  local c state missing
+  # First-deploy timeout: 600 s. ONLYOFFICE, Nextcloud, and Dolibarr run
+  # DB migrations on first boot and can take well over 300 s on slow hardware.
+  local deadline=$(( $(date +%s) + 600 ))
+  local c state missing not_ready exited
   while :; do
     missing=0
+    exited=0
+    not_ready=()
     for c in "${EXPECTED_CONTAINERS[@]}"; do
       state=$(docker inspect -f '{{.State.Status}}' "${c}" 2>/dev/null || echo "absent")
-      [[ "${state}" == "running" ]] || { missing=1; break; }
+      if [[ "${state}" != "running" ]]; then
+        missing=1
+        not_ready+=( "${c}(${state})" )
+        # A container in exited/dead state won't recover by waiting longer
+        if [[ "${state}" == "exited" || "${state}" == "dead" ]]; then
+          exited=1
+        fi
+      fi
     done
     (( missing == 0 )) && break
+    if (( exited == 1 )); then
+      printf '\n'
+      printf '\n  Crashed containers: %s\n' "${not_ready[*]}" >&2
+      printf '  Check logs:  cd /srv/stack && docker compose logs --tail=50 %s\n'         "$(printf '%s\n' "${not_ready[@]}" | sed 's/(.*//' | tr '\n' ' ')" >&2
+      die "One or more containers exited — waiting will not help. See logs above."
+    fi
     if (( $(date +%s) > deadline )); then
       printf '\n'
-      die "Timed out waiting for containers. Inspect with:
-    docker compose ps
-    docker compose logs --tail=50"
+      printf '\n  Still not ready after 600 s: %s\n' "${not_ready[*]}" >&2
+      die "Timed out waiting for containers.
+    Check status:  cd /srv/stack && docker compose ps
+    Check logs:    docker compose logs --tail=80 <container-name>
+    Common cause:  DB migration on first boot. Re-run deploy.sh — data is preserved."
     fi
     printf '.'
     sleep 5
