@@ -214,18 +214,30 @@ load_env() {
 # varies by image version — www-data (33) in older images, a dynamic uid
 # in newer ones. We detect the owner at runtime so occ always runs as the
 # correct user regardless of which uid the image chose.
-_nc_occ_user() {
-  docker exec "${NC_CONTAINER}" stat -c '%u' /var/www/html/config/config.php 2>/dev/null     || echo "www-data"
+# Detect uid that owns config.php once and cache it.
+# Newer Nextcloud images use a dynamic uid (e.g. 995) rather than www-data (33).
+NC_OCC_USER=""
+_resolve_occ_user() {
+  if [[ -n "${NC_OCC_USER}" ]]; then return 0; fi
+  local uid
+  uid=$(docker exec "${NC_CONTAINER}" stat -c "%u" /var/www/html/config/config.php 2>/dev/null || true)
+  if [[ "${uid}" =~ ^[0-9]+$ && "${uid}" != "0" ]]; then
+    NC_OCC_USER="${uid}"
+  else
+    NC_OCC_USER="33"  # traditional www-data fallback
+  fi
 }
 
 occ() {
-  run docker exec -u "$(_nc_occ_user)" "${NC_CONTAINER}" php /var/www/html/occ "$@"
+  _resolve_occ_user
+  run docker exec -u "${NC_OCC_USER}" "${NC_CONTAINER}" php /var/www/html/occ "$@"
 }
 
 # occ with output capture (NOT run through run(), since dry-run has nothing
 # meaningful to capture — callers handle the dry-run case themselves).
 occ_capture() {
-  docker exec -u "$(_nc_occ_user)" "${NC_CONTAINER}" php /var/www/html/occ "$@"
+  _resolve_occ_user
+  docker exec -u "${NC_OCC_USER}" "${NC_CONTAINER}" php /var/www/html/occ "$@"
 }
 
 
