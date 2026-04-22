@@ -358,13 +358,15 @@ services:
     environment:
       <<: *common-env
       APP_ENV: prod
-      TRUSTED_HOSTS: localhost,time.${DOMAIN}
+      TRUSTED_HOSTS: localhost,127.0.0.1,time.${DOMAIN}
       TRUSTED_PROXIES: 172.16.0.0/12
       DATABASE_URL: mysql://kimai:${KIMAI_DB_PASS}@kimai-db/kimai?charset=utf8mb4&serverVersion=10.11.0-MariaDB
       ADMINMAIL: ${KIMAI_ADMIN_EMAIL}
       ADMINPASS: ${KIMAI_ADMIN_PASS}
-      MAILER_URL: "smtp://${SMTP_USER}:${SMTP_PASS}@${SMTP_HOST}:${SMTP_PORT}"
-      MAILER_FROM: ${SMTP_FROM}
+      # MAILER_URL: only set when SMTP is configured. Empty SMTP vars produce
+      # a malformed URL (smtp://:@:587) that crashes Kimai on boot.
+      MAILER_URL: ${KIMAI_MAILER_URL:-null://null}
+      MAILER_FROM: ${SMTP_FROM:-noreply@localhost}
     volumes:
       - ./kimai/data:/opt/kimai/var/data
     networks: [internal]

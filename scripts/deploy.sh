@@ -499,6 +499,20 @@ render_env() {
   set_if_empty NC_ADMIN_USER         "admin"
   set_if_empty PAPERLESS_ADMIN_USER  "admin"
   set_if_empty KIMAI_ADMIN_EMAIL     "${KIMAI_ADMIN_EMAIL}"
+  # Build KIMAI_MAILER_URL from SMTP vars if SMTP_HOST is set.
+  # Kimai crashes with a malformed URL when vars are empty, so we use
+  # null://null as a safe no-op transport when email is not configured.
+  local smtp_host
+  smtp_host=$(awk -F= -v v="SMTP_HOST" '$1==v{sub(/^[^=]*=/,"");print;exit}' "${env_file}")
+  if [[ -n "${smtp_host}" ]]; then
+    local smtp_user smtp_pass smtp_port smtp_from
+    smtp_user=$(awk -F= -v v="SMTP_USER" '$1==v{sub(/^[^=]*=/,"");print;exit}' "${env_file}")
+    smtp_pass=$(awk -F= -v v="SMTP_PASS" '$1==v{sub(/^[^=]*=/,"");print;exit}' "${env_file}")
+    smtp_port=$(awk -F= -v v="SMTP_PORT" '$1==v{sub(/^[^=]*=/,"");print;exit}' "${env_file}")
+    set_if_empty KIMAI_MAILER_URL "smtp://${smtp_user}:${smtp_pass}@${smtp_host}:${smtp_port:-587}"
+  else
+    set_if_empty KIMAI_MAILER_URL "null://null"
+  fi
 
   # Generated secrets
   set_if_empty NC_DB_PASS           "$(rand_b64 32)"
